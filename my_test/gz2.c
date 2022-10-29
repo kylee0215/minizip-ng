@@ -8,6 +8,7 @@
 #include <inttypes.h> // for uint64_t
 
 #include "zipcrypto.h"
+#include "mz.h"
 
 #define WRITEBUFFERSIZE (16384)
 #define MAXFILENAME (256)
@@ -68,9 +69,15 @@ typedef struct {
 	};
 	uint16_t verifier;
 
+	/* ZipCrypto */
 	uint32_t crcForCrypting;
 	uint32_t keys[3];	 /* keys defining the pseudo-random sequence */
 	unsigned crypt_header_size;
+
+	/* WinZip AES-256 */
+	void *wzaes;
+	int16_t aes_encryption_mode;
+	int aes_version; // AE-1, AE-2
 } zip_entry_info;
 
 typedef struct {
@@ -207,18 +214,26 @@ int Write_LocalFileHeader(zip64_info *zi, char *filenameinzip, int level, char *
 	char *LocalFileHdr = NULL;
 	char *cur;
 	uInt size_extrafield = 2 + 2 + 16; // hdr + size + uncompress_size + compress_size for zip64
+	uInt aes_extrafield_size = 0;
 	uLong flag = 0;
+	void *wzaes = NULL;
 
-#if ZIPCRYPTO
+#if ZIPCRYPTO || WZAES
 	if (password)
 		flag |= 1;
+	wzaes = zi->entry[zi->cur_entry].wzaes;
 #endif
+
+	if (wzaes) {
+		aes_extrafield_size = 4 + 2 + 2 + 1 + 2; // integer ver, vendorID, AES encryption mode, compress method
+		size_extrafield += aes_extrafield_size;
+	}
 
 	if (level == Z_BEST_SPEED)
 		flag |= 6;
 	flag |= 8; // set bit 3, because we don't know the size and crc when we write local hdr
 
-	LocalFileHdr = malloc(128);
+	LocalFileHdr = malloc(256);
 	cur = LocalFileHdr;
 
 	uInt size_filename = (uInt)strlen(filenameinzip);
@@ -232,7 +247,10 @@ int Write_LocalFileHeader(zip64_info *zi, char *filenameinzip, int level, char *
 	err = zip64local_putValue(cur, flag, 2);
 	cur += 2;
 
-	err = zip64local_putValue(cur, Z_DEFLATED, 2);
+	if (!wzaes)
+		err = zip64local_putValue(cur, Z_DEFLATED, 2);
+	else
+		err = zip64local_putValue(cur, MZ_COMPRESS_METHOD_AES, 2); // WinZip AES
 	cur += 2;
 
 	err = zip64local_putValue(cur, zi->entry[zi->cur_entry].mod_time, 2); // Mod:time
@@ -292,6 +310,23 @@ int Write_LocalFileHeader(zip64_info *zi, char *filenameinzip, int level, char *
 		zi->entry[zi->cur_entry].encrypt = 0;
 #endif
 
+#if WZAES
+	if (wzaes) {
+		zip64local_putValue(cur, 0x9901, 2); // AES
+		cur += 2;
+		zip64local_putValue(cur, 2 + 2 + 1 + 2, 2);
+		cur += 2;
+		zip64local_putValue(cur, zi->entry[zi->cur_entry].aes_version, 2); // AE-1
+		cur += 2;
+		memcpy(cur, "AE", 2);
+		cur += 2;
+		zip64local_putValue(cur, wzaes->aes_encryption_mode, 1);
+		cur += 1;
+		zip64local_putValue(cur, zi->entry[zi->cur_entry].method, 2);
+		cur += 2;
+	}
+#endif
+
 	zi->entry[zi->cur_entry].loc_offset = zi->cur_offset;
 	zi->entry[zi->cur_entry].LocHdrSize = cur - LocalFileHdr;
 	/* zi->cur_offset += zi->entry[zi->cur_entry].LocHdrSize; */
@@ -338,9 +373,18 @@ int Write_CentralFileHeader(zip64_info *zi)
 	char *CentralDirFileHdr = NULL;
 	uLong invalidValue = 0xffffffff;
 
-	CentralDirFileHdr = malloc(128);
+	CentralDirFileHdr = malloc(256);
 
 	for (i = 0; i < zi->number_entry; i++) {
+		void *wzaes = zi->entry[i].wzaes;
+		uInt aes_extrafield_size = 0;
+		uInt size_extrafield = 2 + 2 + 8 + 8 + 8; // HdrID + SizeOfExtraFieldTrunk + UncompressedDataSize + CompressedSize + OffsetOfLocalHdrRecord
+
+		if (wzaes) {
+			aes_extrafield_size = 4 + 2 + 2 + 1 + 2; // integer ver, vendorID, AES encryption mode, compress method
+			size_extrafield += aes_extrafield_size;
+		}
+
 		cur = CentralDirFileHdr;
 
 		zip64local_putValue(cur, CENTRALHEADERMAGIC, 4);
@@ -355,7 +399,10 @@ int Write_CentralFileHeader(zip64_info *zi)
 		zip64local_putValue(cur, zi->entry[i].flag, 2);
 		cur += 2;
 
-		zip64local_putValue(cur, zi->entry[i].method, 2);
+		if (!wzaes)
+			zip64local_putValue(cur, zi->entry[i].method, 2);
+		else
+			zip64local_putValue(cur, MZ_COMPRESS_METHOD_AES, 2);
 		cur += 2;
 
 		zip64local_putValue(cur, zi->entry[i].mod_time, 2); // Mod:time
@@ -382,7 +429,7 @@ int Write_CentralFileHeader(zip64_info *zi)
 		cur += 2;
 
 		// Extra field length
-		zip64local_putValue(cur, 2 + 2 + 8 + 8 + 8, 2); // HdrID + SizeOfExtraFieldTrunk + UncompressedDataSize + CompressedSize + OffsetOfLocalHdrRecord
+		zip64local_putValue(cur, size_extrafield, 2); // HdrID + SizeOfExtraFieldTrunk + UncompressedDataSize + CompressedSize + OffsetOfLocalHdrRecord
 		cur += 2;
 
 		// File comment length
@@ -427,6 +474,22 @@ int Write_CentralFileHeader(zip64_info *zi)
 		zip64local_putValue(cur, zi->entry[i].loc_offset, 8);
 		cur += 8;
 
+#if WZAES
+		if (wzaes) {
+			zip64local_putValue(cur, 0x9901, 2); // AES
+			cur += 2;
+			zip64local_putValue(cur, 2 + 2 + 1 + 2, 2);
+			cur += 2;
+			zip64local_putValue(cur, zi->entry[zi->cur_entry].aes_version, 2); // AE-1
+			cur += 2;
+			memcpy(cur, "AE", 2);
+			cur += 2;
+			zip64local_putValue(cur, wzaes->aes_encryption_mode, 1);
+			cur += 1;
+			zip64local_putValue(cur, zi->entry[zi->cur_entry].method, 2);
+			cur += 2;
+		}
+#endif
 		if (i == 0)
 			zi->entry[i].cen_offset = zi->cur_offset; // save Offset of start of central directory
 
@@ -819,6 +882,7 @@ int main(int argc, char *argv[])
 		char *filenameinzip = argv[i];
 		char *savefilenameinzip;
 		unsigned long crcFile = 0;
+		void *wzaes = NULL;
 
 		InitZipStruct(zi, filename_try, false);
 		size_buf = WRITEBUFFERSIZE;
@@ -831,6 +895,13 @@ int main(int argc, char *argv[])
 		get_file_time(zi, filenameinzip);
 
 		/* err = getFileCrc(filenameinzip, buf, size_buf, &zi->entry[zi->cur_entry].crcForCrypting); */
+
+#if WZAES
+		wzaes = zi->entry[zi->cur_entry].wzaes = my_wzaes_new();
+		my_wzaes_set_password(wzaes, password);
+		my_wzaes_set_encryption_mode(wzaes, Z_AES_ENCRYPTION_MODE_256);
+		zi->entryp[zi->cur_entry].aes_version = MZ_AES_VERSION; // AE-1
+#endif
 
 		Write_LocalFileHeader(zi, filenameinzip, Z_BEST_SPEED, password); // Add local header for this entry
 
