@@ -285,10 +285,12 @@ int Write_LocalFileHeader(zip64_info *zi, char *filenameinzip, int level, char *
 	zi->entry[zi->cur_entry].method = Z_DEFLATED;
 	zi->entry[zi->cur_entry].zip64 = 1;
 
+#if ZIPCRYPTO
 	if (flag & 0x1)
 		zi->entry[zi->cur_entry].encrypt = 1;
 	else
 		zi->entry[zi->cur_entry].encrypt = 0;
+#endif
 
 	zi->entry[zi->cur_entry].loc_offset = zi->cur_offset;
 	zi->entry[zi->cur_entry].LocHdrSize = cur - LocalFileHdr;
@@ -832,9 +834,8 @@ int main(int argc, char *argv[])
 
 		Write_LocalFileHeader(zi, filenameinzip, Z_BEST_SPEED, password); // Add local header for this entry
 
-		zi->entry[zi->cur_entry].verifier = get_verifier(zi);
-
 #if ZIPCRYPTO
+		zi->entry[zi->cur_entry].verifier = get_verifier(zi);
 		Write_EncryptHeader(zi, password);
 #endif
 		/* zi->entry[zi->cur_entry-1].crc32 = crcFile; */
