@@ -1,100 +1,9 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <zlib.h>
-#include <sys/stat.h>
-#include <stdbool.h>
-#include <time.h>
-#include <inttypes.h> // for uint64_t
+#include "write_out.h"
+#include "mz_strm.h"
+#include "mz_strm_wzaes.h"
 
-#include "zipcrypto.h"
-#include "mz.h"
-
-#define WRITEBUFFERSIZE (16384)
-#define MAXFILENAME (256)
-
-#define Z_BUFSIZE (64 * 1024)
-#define VersionMadeBy (45)
-#define VersionNeeded (45)
-
-#define ZIP_OK                          (0)
-#define ZIP_EOF                         (0)
-#define ZIP_ERRNO                       (Z_ERRNO)
-#define ZIP_PARAMERROR                  (-102)
-#define ZIP_BADZIPFILE                  (-103)
-#define ZIP_INTERNALERROR               (-104)
-
-#define LOCALHEADERMAGIC    (0x04034b50)
-#define CENTRALHEADERMAGIC  (0x02014b50)
-#define ENDHEADERMAGIC      (0x06054b50)
-#define ZIP64ENDHEADERMAGIC      (0x06064b50)
-#define ZIP64ENDLOCHEADERMAGIC   (0x07064b50)
-#define ZIP64DATADESCHEADERMAGIC   (0x08074b50)
-
-#define ZIPCRYPTO 1
-
-typedef unsigned int uInt;
-typedef unsigned long uLong;
-
-#define RAND_HEAD_LEN 12
-
-typedef struct {
-	char filename[256];
-	unsigned long crc32;
-	unsigned long flag;
-	int method;
-	int encrypt;
-	int zip64;
-	uint64_t pos_zip64extrainfo;
-	uint64_t totalCompressedData;
-	uint64_t totalUncompressedData;
-	uint64_t LocHdrSize;
-	uint64_t loc_offset; // Relative offset of local file header for CEN
-	uint64_t cen_offset; // Offset of start of central directory, relative to start of archive for EOCD
-	union {
-		uint16_t mod_time;
-		struct {
-			unsigned tm_sec:5;
-			unsigned tm_min:6;
-			unsigned tm_hour:5;
-		};
-	};
-	union {
-		uint16_t mod_date;
-		struct {
-			unsigned tm_mday:5;
-			unsigned tm_mon:4;
-			unsigned tm_year:7;
-		};
-	};
-	uint16_t verifier;
-
-	/* ZipCrypto */
-	uint32_t crcForCrypting;
-	uint32_t keys[3];	 /* keys defining the pseudo-random sequence */
-	unsigned crypt_header_size;
-
-	/* WinZip AES-256 */
-	void *wzaes;
-	int16_t aes_encryption_mode;
-	int aes_version; // AE-1, AE-2
-} zip_entry_info;
-
-typedef struct {
-	z_stream stream;
-	uInt number_entry;
-	int cur_entry;
-	zip_entry_info entry[128];
-	char out_zip[256];
-	uLong cur_offset;
-	uLong size_centraldir;
-	unsigned char buffered_data[Z_BUFSIZE];
-	uInt pos_in_buffered_data;
-	uLong Zip64EOCDRecord_offset;
-
-	// output zip file function pointer
-	size_t (*write)(char *buf, uLong size, void *zi);
-} zip64_info;
+/* #define ZIPCRYPTO 1 */
+/* #define WZAES 1 */
 
 uint16_t get_verifier(zip64_info *zi)
 {
@@ -196,7 +105,7 @@ int Write_EncryptHeader(zip64_info *zi, char *password)
 		uint8_t header[RAND_HEAD_LEN];
 		unsigned int HdrSize;
 
-		HdrSize = encrypt_init(header, zei->keys, password, zei->verifier);
+		HdrSize = zipcrypto_encrypt_init(header, zei->keys, password, zei->verifier);
 		zei->crypt_header_size = HdrSize;
 
 		size_t ret = zi->write(header, HdrSize, zi);
@@ -241,13 +150,13 @@ int Write_LocalFileHeader(zip64_info *zi, char *filenameinzip, int level, char *
 	err = zip64local_putValue(cur, LOCALHEADERMAGIC, 4); // LocalFileHdr magic number
 	cur += 4;
 
-	err = zip64local_putValue(cur, 45, 2); // version 4.5 support zip64
+	err = zip64local_putValue(cur, VersionNeeded, 2); // version 4.5 support zip64, 5.1 support AES
 	cur += 2;
 
 	err = zip64local_putValue(cur, flag, 2);
 	cur += 2;
 
-	if (!wzaes)
+	if (zi->entry[zi->cur_entry].aes_version == 0)
 		err = zip64local_putValue(cur, Z_DEFLATED, 2);
 	else
 		err = zip64local_putValue(cur, MZ_COMPRESS_METHOD_AES, 2); // WinZip AES
@@ -311,7 +220,7 @@ int Write_LocalFileHeader(zip64_info *zi, char *filenameinzip, int level, char *
 #endif
 
 #if WZAES
-	if (wzaes) {
+	if (zi->entry[zi->cur_entry].aes_version) {
 		zip64local_putValue(cur, 0x9901, 2); // AES
 		cur += 2;
 		zip64local_putValue(cur, 2 + 2 + 1 + 2, 2);
@@ -320,7 +229,7 @@ int Write_LocalFileHeader(zip64_info *zi, char *filenameinzip, int level, char *
 		cur += 2;
 		memcpy(cur, "AE", 2);
 		cur += 2;
-		zip64local_putValue(cur, wzaes->aes_encryption_mode, 1);
+		zip64local_putValue(cur, zi->entry[zi->cur_entry].aes_encryption_mode, 1);
 		cur += 1;
 		zip64local_putValue(cur, zi->entry[zi->cur_entry].method, 2);
 		cur += 2;
@@ -354,16 +263,17 @@ int Write_DataDescriptor(zip64_info *zi)
 	cur += 4;
 
 	zip64local_putValue(cur, zi->entry[zi->cur_entry].totalCompressedData, 8);
-	cur += 4;
+	cur += 8;
 
 	zip64local_putValue(cur, zi->entry[zi->cur_entry].totalUncompressedData, 8);
-	cur += 4;
+	cur += 8;
 
 	size_t ret = zi->write(buf, cur - buf, zi);
 	if (ret != cur - buf) {
 		printf("data descript fail, ret: %d, size: %d\n", ret, cur - buf);
 		exit(0);
 	}
+	free(buf);
 	return ret;
 }
 int Write_CentralFileHeader(zip64_info *zi)
@@ -376,11 +286,10 @@ int Write_CentralFileHeader(zip64_info *zi)
 	CentralDirFileHdr = malloc(256);
 
 	for (i = 0; i < zi->number_entry; i++) {
-		void *wzaes = zi->entry[i].wzaes;
 		uInt aes_extrafield_size = 0;
 		uInt size_extrafield = 2 + 2 + 8 + 8 + 8; // HdrID + SizeOfExtraFieldTrunk + UncompressedDataSize + CompressedSize + OffsetOfLocalHdrRecord
 
-		if (wzaes) {
+		if (zi->entry[i].aes_version) {
 			aes_extrafield_size = 4 + 2 + 2 + 1 + 2; // integer ver, vendorID, AES encryption mode, compress method
 			size_extrafield += aes_extrafield_size;
 		}
@@ -399,7 +308,7 @@ int Write_CentralFileHeader(zip64_info *zi)
 		zip64local_putValue(cur, zi->entry[i].flag, 2);
 		cur += 2;
 
-		if (!wzaes)
+		if (zi->entry[i].aes_version == 0)
 			zip64local_putValue(cur, zi->entry[i].method, 2);
 		else
 			zip64local_putValue(cur, MZ_COMPRESS_METHOD_AES, 2);
@@ -475,20 +384,18 @@ int Write_CentralFileHeader(zip64_info *zi)
 		cur += 8;
 
 #if WZAES
-		if (wzaes) {
-			zip64local_putValue(cur, 0x9901, 2); // AES
-			cur += 2;
-			zip64local_putValue(cur, 2 + 2 + 1 + 2, 2);
-			cur += 2;
-			zip64local_putValue(cur, zi->entry[zi->cur_entry].aes_version, 2); // AE-1
-			cur += 2;
-			memcpy(cur, "AE", 2);
-			cur += 2;
-			zip64local_putValue(cur, wzaes->aes_encryption_mode, 1);
-			cur += 1;
-			zip64local_putValue(cur, zi->entry[zi->cur_entry].method, 2);
-			cur += 2;
-		}
+		zip64local_putValue(cur, 0x9901, 2); // AES
+		cur += 2;
+		zip64local_putValue(cur, 2 + 2 + 1 + 2, 2);
+		cur += 2;
+		zip64local_putValue(cur, zi->entry[i].aes_version, 2); // AE-1
+		cur += 2;
+		memcpy(cur, "AE", 2);
+		cur += 2;
+		zip64local_putValue(cur, zi->entry[i].aes_encryption_mode, 1);
+		cur += 1;
+		zip64local_putValue(cur, zi->entry[i].method, 2);
+		cur += 2;
 #endif
 		if (i == 0)
 			zi->entry[i].cen_offset = zi->cur_offset; // save Offset of start of central directory
@@ -726,6 +633,7 @@ static int getFileCrc(char *filenameinzip, void *buf, unsigned long size_buf, un
 int zip64FlushWriteBuffer(zip64_info *zi)
 {
 	int err = ZIP_OK;
+	size_t ret = 0;
 
 #if ZIPCRYPTO
 	if (zi->entry[zi->cur_entry].encrypt != 0) {
@@ -741,7 +649,11 @@ int zip64FlushWriteBuffer(zip64_info *zi)
 	}
 #endif
 
-	size_t ret = zi->write(zi->buffered_data, zi->pos_in_buffered_data, zi);
+	if (zi->entry[zi->cur_entry].wzaes)
+		ret = mz_stream_wzaes_write(zi->entry[zi->cur_entry].wzaes, zi->buffered_data, zi->pos_in_buffered_data, zi);
+	else
+		ret = zi->write(zi->buffered_data, zi->pos_in_buffered_data, zi);
+
 	if (ret != zi->pos_in_buffered_data) {
 		printf("write not match: ret: %ld, pos_in_buffered_data:%d\n", ret, zi->pos_in_buffered_data);
 		exit(0);
@@ -801,6 +713,7 @@ int zipWriteInFileInZip(zip64_info *zi, void *buf, unsigned int len)
 int zipCloseFileInZip(zip64_info *zi)
 {
 	int err = ZIP_OK;
+	uint64_t compressed_size = 0;
 
 	zi->stream.avail_in = 0;
 	if (true || zi->entry[zi->cur_entry].method == Z_DEFLATED) {
@@ -844,7 +757,22 @@ int zipCloseFileInZip(zip64_info *zi)
 	}
 
 	printf("%s:%d\n", __func__, __LINE__);
+
+#if ZIPCRYPTO
 	zi->entry[zi->cur_entry].totalCompressedData += zi->entry[zi->cur_entry].crypt_header_size;
+#endif
+
+	if (zi->entry[zi->cur_entry].aes_version) {
+		// write authentication key out
+		mz_stream_wzaes_close(zi->entry[zi->cur_entry].wzaes, zi);
+
+		// update compressed_size
+		// compressed_size = salt value + password verify value + encrypted data len + authencation value
+		printf("before add wzaes key*2 + password verify: %d\n", zi->entry[zi->cur_entry].totalCompressedData);
+    	mz_stream_wzaes_get_prop_int64(zi->entry[zi->cur_entry].wzaes, MZ_STREAM_PROP_TOTAL_OUT, &compressed_size);
+		zi->entry[zi->cur_entry].totalCompressedData = compressed_size;
+		printf("compressed size = %d\n", zi->entry[zi->cur_entry].totalCompressedData);
+	}
 
 	printf("%s: ret: %d\n", __func__, err);
 	return err;
@@ -897,10 +825,14 @@ int main(int argc, char *argv[])
 		/* err = getFileCrc(filenameinzip, buf, size_buf, &zi->entry[zi->cur_entry].crcForCrypting); */
 
 #if WZAES
-		wzaes = zi->entry[zi->cur_entry].wzaes = my_wzaes_new();
-		my_wzaes_set_password(wzaes, password);
-		my_wzaes_set_encryption_mode(wzaes, Z_AES_ENCRYPTION_MODE_256);
-		zi->entryp[zi->cur_entry].aes_version = MZ_AES_VERSION; // AE-1
+		/* wzaes = zi->entry[zi->cur_entry].wzaes = my_wzaes_new(); */
+        mz_stream_wzaes_create(&zi->entry[zi->cur_entry].wzaes);
+		wzaes = zi->entry[zi->cur_entry].wzaes;
+
+		mz_stream_wzaes_set_password(wzaes, password);
+		mz_stream_wzaes_set_encryption_mode(wzaes, MZ_AES_ENCRYPTION_MODE_256);
+		zi->entry[zi->cur_entry].aes_version = MZ_AES_VERSION; // AE-1
+		zi->entry[zi->cur_entry].aes_encryption_mode = MZ_AES_ENCRYPTION_MODE_256; // mode=0x3, AES-256
 #endif
 
 		Write_LocalFileHeader(zi, filenameinzip, Z_BEST_SPEED, password); // Add local header for this entry
@@ -908,6 +840,12 @@ int main(int argc, char *argv[])
 #if ZIPCRYPTO
 		zi->entry[zi->cur_entry].verifier = get_verifier(zi);
 		Write_EncryptHeader(zi, password);
+#endif
+
+#if WZAES
+		/* Generate salt value, encryption key, authentication key, password verify value and write */
+		/* salt value and password verify value before encryption data buf after local file header */
+		mz_stream_wzaes_open(zi->entry[zi->cur_entry].wzaes, password, MZ_OPEN_MODE_WRITE, zi);
 #endif
 		/* zi->entry[zi->cur_entry-1].crc32 = crcFile; */
 		/* struct stat st; */
@@ -953,6 +891,10 @@ int main(int argc, char *argv[])
 			exit(0);
 		}
 		Write_DataDescriptor(zi);
+		printf("write data desc done\n");
+
+		// Free the memory
+		mz_stream_wzaes_delete(&zi->entry[zi->cur_entry].wzaes);
 
 		zi->number_entry++;
 		zi->cur_entry++;
@@ -971,6 +913,7 @@ int main(int argc, char *argv[])
 
 	// Add EOCD record
 	err = Write_EOCDRecord(zi);
+	printf("write EOCD record\n");
 
 	printf("zip finish\n");
 
